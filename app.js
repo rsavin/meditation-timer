@@ -22,6 +22,7 @@
   // Constants
   const CIRCUMFERENCE = 2 * Math.PI * 90; // r=90
   const VOLUME = 0.8;
+  const AUDIO_URL = '/generated-audio/meditation.wav';
 
   // State
   let totalSeconds = 0;
@@ -33,24 +34,86 @@
   let bell1Buffer = null;
   let bell2Buffer = null;
   let audioReady = false;
-  let meditationBlobUrl = null; // Pre-generated WAV blob URL
+  let audioCached = false; // Whether current WAV is cached in SW
   let regenerateTimer = null;
 
-  // The <audio> element for playback (survives background/lock screen)
+  // Persistent <audio> element (must stay in DOM for background playback)
   const audioEl = new Audio();
   audioEl.preload = 'auto';
-  let meditationActive = false; // Track whether a meditation session is running
+  let meditationActive = false;
+
+  // Service Worker readiness
+  let swReady = false;
+
+  async function waitForSW() {
+    if (swReady) return true;
+    if (!('serviceWorker' in navigator)) return false;
+    try {
+      const reg = await navigator.serviceWorker.ready;
+      // Ensure the SW is active and controlling this page
+      if (reg.active) {
+        // If page isn't controlled yet (first load), claim it
+        if (!navigator.serviceWorker.controller) {
+          // Wait briefly for controller to be set after claim
+          await new Promise(resolve => {
+            navigator.serviceWorker.addEventListener('controllerchange', resolve, { once: true });
+            // Timeout fallback
+            setTimeout(resolve, 2000);
+          });
+        }
+        swReady = true;
+        return true;
+      }
+    } catch (e) {
+      console.warn('SW not ready:', e);
+    }
+    return false;
+  }
+
+  // Cache a WAV blob in the service worker
+  async function cacheAudioInSW(wavBlob) {
+    if (!navigator.serviceWorker.controller) {
+      console.warn('No SW controller, falling back to blob URL');
+      return false;
+    }
+
+    return new Promise((resolve) => {
+      const handler = (e) => {
+        if (e.data.type === 'audio-cached') {
+          navigator.serviceWorker.removeEventListener('message', handler);
+          resolve(true);
+        }
+      };
+      navigator.serviceWorker.addEventListener('message', handler);
+
+      navigator.serviceWorker.controller.postMessage({
+        type: 'cache-audio',
+        url: AUDIO_URL,
+        blob: wavBlob,
+      });
+
+      // Timeout fallback
+      setTimeout(() => {
+        navigator.serviceWorker.removeEventListener('message', handler);
+        resolve(false);
+      }, 5000);
+    });
+  }
 
   // Unlock audio on first user interaction (critical for iOS)
   function unlockAudio() {
     if (audioCtx) return;
     audioCtx = new (window.AudioContext || window.webkitAudioContext)();
 
-    // iOS: play silent audio element to unlock it for background playback
-    audioEl.src = 'data:audio/wav;base64,UklGRiQAAABXQVZFZm10IBAAAAABAAEARKwAAIhYAQACABAAZGF0YQAAAAA=';
-    audioEl.play().catch(() => {});
+    // Prime the <audio> element with a silent WAV (establishes audio session on iOS)
+    const silentWav = 'data:audio/wav;base64,UklGRiQAAABXQVZFZm10IBAAAAABAAEAQB8AAEAfAAABAAgAZGF0YQAAAAA=';
+    audioEl.src = silentWav;
+    audioEl.play().then(() => {
+      audioEl.pause();
+      audioEl.src = '';
+    }).catch(() => {});
 
-    // Also unlock AudioContext (needed for decoding)
+    // Unlock AudioContext (needed for decoding)
     const silentBuffer = audioCtx.createBuffer(1, 1, audioCtx.sampleRate);
     const silentSource = audioCtx.createBufferSource();
     silentSource.buffer = silentBuffer;
@@ -62,7 +125,7 @@
     }
 
     loadBells().then(() => {
-      if (audioReady) regenerateWav();
+      if (audioReady) scheduleRegenerate();
     });
   }
 
@@ -138,7 +201,6 @@
     const arrayBuffer = new ArrayBuffer(headerSize + dataSize);
     const view = new DataView(arrayBuffer);
 
-    // WAV header
     writeString(view, 0, 'RIFF');
     view.setUint32(4, 36 + dataSize, true);
     writeString(view, 8, 'WAVE');
@@ -153,7 +215,6 @@
     writeString(view, 36, 'data');
     view.setUint32(40, dataSize, true);
 
-    // Interleave channels and write PCM samples
     const channels = [];
     for (let ch = 0; ch < numChannels; ch++) {
       channels.push(buffer.getChannelData(ch));
@@ -178,25 +239,35 @@
     }
   }
 
-  // Regenerate WAV blob from current slider values (debounced)
+  // Regenerate WAV and cache in service worker (debounced)
   function scheduleRegenerate() {
     if (!audioReady) return;
     clearTimeout(regenerateTimer);
     regenerateTimer = setTimeout(regenerateWav, 150);
   }
 
-  function regenerateWav() {
+  async function regenerateWav() {
     if (!audioReady) return;
     const duration = parseInt(durationSlider.value);
     const intervalMin = parseInt(intervalSlider.value);
     const buffer = buildMeditationBuffer(duration * 60, intervalMin);
     const wavBlob = audioBufferToWav(buffer);
 
-    // Revoke old blob URL to free memory
-    if (meditationBlobUrl) {
-      URL.revokeObjectURL(meditationBlobUrl);
+    audioCached = false;
+
+    // Try to cache via service worker
+    const hasSW = await waitForSW();
+    if (hasSW) {
+      const cached = await cacheAudioInSW(wavBlob);
+      if (cached) {
+        audioCached = true;
+        return;
+      }
     }
-    meditationBlobUrl = URL.createObjectURL(wavBlob);
+
+    // Fallback: use blob URL (won't work on iOS background but works for desktop)
+    audioEl._fallbackBlobUrl = URL.createObjectURL(wavBlob);
+    audioCached = false;
   }
 
   // Formatting
@@ -341,7 +412,6 @@
     // Wait for bells to load if not ready yet
     if (!audioReady) {
       await loadBells();
-      regenerateWav();
     }
 
     if (!audioReady) {
@@ -349,15 +419,23 @@
       return;
     }
 
-    // If WAV wasn't generated yet, generate now
-    if (!meditationBlobUrl) {
-      regenerateWav();
+    // Regenerate if not cached yet
+    if (!audioCached && !audioEl._fallbackBlobUrl) {
+      await regenerateWav();
     }
 
-    // Set the audio source and play
-    audioEl.src = meditationBlobUrl;
-    audioEl.currentTime = 0;
+    // Set the audio source: prefer SW-cached URL, fall back to blob URL
+    if (audioCached) {
+      audioEl.src = AUDIO_URL;
+    } else if (audioEl._fallbackBlobUrl) {
+      audioEl.src = audioEl._fallbackBlobUrl;
+    } else {
+      // Last resort: regenerate synchronously
+      await regenerateWav();
+      audioEl.src = audioCached ? AUDIO_URL : (audioEl._fallbackBlobUrl || '');
+    }
 
+    audioEl.currentTime = 0;
     meditationActive = true;
 
     try {
@@ -386,7 +464,6 @@
     clearInterval(uiInterval);
     uiInterval = null;
 
-    // Capture elapsed before pausing (pause makes getElapsedSeconds return 0)
     const elapsed = Math.min(getElapsedSeconds(), totalSeconds);
 
     meditationActive = false;
