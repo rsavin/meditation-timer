@@ -1,0 +1,71 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Meditation Timer</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+  <!-- Screen 1: Setup -->
+  <div id="screen-setup" class="screen active">
+    <div class="card">
+      <h1>Meditation Timer</h1>
+
+      <div class="field">
+        <label for="duration">Duration</label>
+        <div class="slider-row">
+          <input type="range" id="duration" min="1" max="120" value="10">
+          <span class="value-display" id="duration-value">10 min</span>
+        </div>
+      </div>
+
+      <div class="field">
+        <label for="interval">Interval Bell</label>
+        <div class="slider-row">
+          <input type="range" id="interval" min="0" max="9" value="0">
+          <span class="value-display" id="interval-value">Off</span>
+        </div>
+      </div>
+
+      <button id="btn-start" class="btn-primary">Start</button>
+    </div>
+  </div>
+
+  <!-- Screen 2: Timer -->
+  <div id="screen-timer" class="screen">
+    <div class="card">
+      <div class="timer-display">
+        <div class="timer-ring">
+          <svg viewBox="0 0 200 200">
+            <circle class="ring-bg" cx="100" cy="100" r="90" />
+            <circle class="ring-progress" id="ring-progress" cx="100" cy="100" r="90" />
+          </svg>
+          <div class="timer-text">
+            <div class="time-remaining" id="time-remaining">10:00</div>
+            <div class="time-label">remaining</div>
+          </div>
+        </div>
+      </div>
+      <div class="time-elapsed" id="time-elapsed">0:00 elapsed</div>
+      <div class="timer-controls">
+        <button id="btn-pause" class="btn-secondary">Pause</button>
+        <button id="btn-finish" class="btn-secondary btn-finish">Finish</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Screen 3: Complete -->
+  <div id="screen-complete" class="screen">
+    <div class="card">
+      <div class="complete-icon">&#10003;</div>
+      <h2>Meditation Complete</h2>
+      <p id="complete-duration">You meditated for 10 minutes.</p>
+      <button id="btn-done" class="btn-primary">Done</button>
+    </div>
+  </div>
+
+  <script src="app.js"></script>
+</body>
+</html>
