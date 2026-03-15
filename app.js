@@ -28,22 +28,29 @@
   let isPaused = false;
   let uiInterval = null;
 
-  // Web Audio API
+  // Audio
   let audioCtx = null;
-  let sourceNode = null;
   let bell1Buffer = null;
   let bell2Buffer = null;
   let audioReady = false;
-  let meditationBuffer = null; // Pre-generated audio buffer
-  let regenerateTimer = null;  // Debounce timer for regeneration
-  let startCtxTime = 0;
+  let meditationBlobUrl = null; // Pre-generated WAV blob URL
+  let regenerateTimer = null;
 
-  // Unlock AudioContext on first user interaction (critical for iOS)
+  // The <audio> element for playback (survives background/lock screen)
+  const audioEl = new Audio();
+  audioEl.preload = 'auto';
+  let meditationActive = false; // Track whether a meditation session is running
+
+  // Unlock audio on first user interaction (critical for iOS)
   function unlockAudio() {
     if (audioCtx) return;
     audioCtx = new (window.AudioContext || window.webkitAudioContext)();
 
-    // Play a tiny silent buffer to unlock audio on iOS
+    // iOS: play silent audio element to unlock it for background playback
+    audioEl.src = 'data:audio/wav;base64,UklGRiQAAABXQVZFZm10IBAAAAABAAEARKwAAIhYAQACABAAZGF0YQAAAAA=';
+    audioEl.play().catch(() => {});
+
+    // Also unlock AudioContext (needed for decoding)
     const silentBuffer = audioCtx.createBuffer(1, 1, audioCtx.sampleRate);
     const silentSource = audioCtx.createBufferSource();
     silentSource.buffer = silentBuffer;
@@ -54,13 +61,16 @@
       audioCtx.resume();
     }
 
-    // Load bell samples, then generate initial buffer
     loadBells().then(() => {
-      if (audioReady) regenerateBuffer();
+      if (audioReady) regenerateWav();
     });
   }
 
-  // Pre-load bell MP3 files
+  ['touchstart', 'touchend', 'click'].forEach(evt => {
+    document.addEventListener(evt, unlockAudio, { once: false, passive: true });
+  });
+
+  // Load bell MP3 files and decode into AudioBuffers
   async function loadBells() {
     if (audioReady) return;
     try {
@@ -80,12 +90,7 @@
     }
   }
 
-  // Attach unlock to multiple event types for maximum iOS compatibility
-  ['touchstart', 'touchend', 'click'].forEach(evt => {
-    document.addEventListener(evt, unlockAudio, { once: false, passive: true });
-  });
-
-  // Build a single AudioBuffer: bell1 → silence → bell2 at intervals → silence → bell1
+  // Build a single AudioBuffer with bells mixed in at the right times
   function buildMeditationBuffer(durationSec, intervalMin) {
     const sampleRate = audioCtx.sampleRate;
     const channels = Math.max(bell1Buffer.numberOfChannels, bell2Buffer.numberOfChannels);
@@ -119,18 +124,79 @@
     return buffer;
   }
 
-  // Regenerate the meditation buffer from current slider values (debounced)
+  // Convert an AudioBuffer to a WAV Blob
+  function audioBufferToWav(buffer) {
+    const numChannels = buffer.numberOfChannels;
+    const sampleRate = buffer.sampleRate;
+    const format = 1; // PCM
+    const bitsPerSample = 16;
+    const bytesPerSample = bitsPerSample / 8;
+    const blockAlign = numChannels * bytesPerSample;
+    const numSamples = buffer.length;
+    const dataSize = numSamples * blockAlign;
+    const headerSize = 44;
+    const arrayBuffer = new ArrayBuffer(headerSize + dataSize);
+    const view = new DataView(arrayBuffer);
+
+    // WAV header
+    writeString(view, 0, 'RIFF');
+    view.setUint32(4, 36 + dataSize, true);
+    writeString(view, 8, 'WAVE');
+    writeString(view, 12, 'fmt ');
+    view.setUint32(16, 16, true);
+    view.setUint16(20, format, true);
+    view.setUint16(22, numChannels, true);
+    view.setUint32(24, sampleRate, true);
+    view.setUint32(28, sampleRate * blockAlign, true);
+    view.setUint16(32, blockAlign, true);
+    view.setUint16(34, bitsPerSample, true);
+    writeString(view, 36, 'data');
+    view.setUint32(40, dataSize, true);
+
+    // Interleave channels and write PCM samples
+    const channels = [];
+    for (let ch = 0; ch < numChannels; ch++) {
+      channels.push(buffer.getChannelData(ch));
+    }
+
+    let offset = 44;
+    for (let i = 0; i < numSamples; i++) {
+      for (let ch = 0; ch < numChannels; ch++) {
+        let sample = channels[ch][i];
+        sample = Math.max(-1, Math.min(1, sample));
+        view.setInt16(offset, sample < 0 ? sample * 0x8000 : sample * 0x7FFF, true);
+        offset += 2;
+      }
+    }
+
+    return new Blob([arrayBuffer], { type: 'audio/wav' });
+  }
+
+  function writeString(view, offset, str) {
+    for (let i = 0; i < str.length; i++) {
+      view.setUint8(offset + i, str.charCodeAt(i));
+    }
+  }
+
+  // Regenerate WAV blob from current slider values (debounced)
   function scheduleRegenerate() {
     if (!audioReady) return;
     clearTimeout(regenerateTimer);
-    regenerateTimer = setTimeout(regenerateBuffer, 150);
+    regenerateTimer = setTimeout(regenerateWav, 150);
   }
 
-  function regenerateBuffer() {
+  function regenerateWav() {
     if (!audioReady) return;
     const duration = parseInt(durationSlider.value);
     const intervalMin = parseInt(intervalSlider.value);
-    meditationBuffer = buildMeditationBuffer(duration * 60, intervalMin);
+    const buffer = buildMeditationBuffer(duration * 60, intervalMin);
+    const wavBlob = audioBufferToWav(buffer);
+
+    // Revoke old blob URL to free memory
+    if (meditationBlobUrl) {
+      URL.revokeObjectURL(meditationBlobUrl);
+    }
+    meditationBlobUrl = URL.createObjectURL(wavBlob);
   }
 
   // Formatting
@@ -191,8 +257,8 @@
   }
 
   function getElapsedSeconds() {
-    if (!audioCtx) return 0;
-    return Math.floor(audioCtx.currentTime - startCtxTime);
+    if (audioEl.paused && !isPaused) return 0;
+    return Math.floor(audioEl.currentTime);
   }
 
   function updateTimerUI() {
@@ -205,6 +271,56 @@
     const offset = CIRCUMFERENCE * (1 - progress);
     ringProgress.style.strokeDasharray = CIRCUMFERENCE;
     ringProgress.style.strokeDashoffset = offset;
+
+    // Update Media Session position
+    if ('mediaSession' in navigator && navigator.mediaSession.setPositionState) {
+      try {
+        navigator.mediaSession.setPositionState({
+          duration: totalSeconds,
+          position: elapsed,
+          playbackRate: 1,
+        });
+      } catch {}
+    }
+  }
+
+  // Media Session API — lock screen controls
+  function setupMediaSession() {
+    if (!('mediaSession' in navigator)) return;
+
+    const duration = parseInt(durationSlider.value);
+    navigator.mediaSession.metadata = new MediaMetadata({
+      title: 'Meditation',
+      artist: duration + ' min',
+      album: 'Meditation Timer',
+    });
+
+    navigator.mediaSession.setActionHandler('play', () => {
+      if (isPaused) {
+        audioEl.play();
+        isPaused = false;
+        uiInterval = setInterval(updateTimerUI, 250);
+        btnPause.textContent = 'Pause';
+      }
+    });
+
+    navigator.mediaSession.setActionHandler('pause', () => {
+      if (!isPaused) {
+        audioEl.pause();
+        isPaused = true;
+        clearInterval(uiInterval);
+        btnPause.textContent = 'Resume';
+      }
+    });
+
+    navigator.mediaSession.setActionHandler('stop', () => {
+      finishMeditation(true);
+    });
+
+    // Disable seek controls
+    navigator.mediaSession.setActionHandler('seekbackward', null);
+    navigator.mediaSession.setActionHandler('seekforward', null);
+    navigator.mediaSession.setActionHandler('seekto', null);
   }
 
   // Timer
@@ -225,7 +341,7 @@
     // Wait for bells to load if not ready yet
     if (!audioReady) {
       await loadBells();
-      regenerateBuffer();
+      regenerateWav();
     }
 
     if (!audioReady) {
@@ -233,53 +349,51 @@
       return;
     }
 
-    // If buffer wasn't generated yet (e.g. no slider interaction), generate now
-    if (!meditationBuffer) {
-      regenerateBuffer();
+    // If WAV wasn't generated yet, generate now
+    if (!meditationBlobUrl) {
+      regenerateWav();
     }
 
-    // Stop any previous source
-    if (sourceNode) {
-      sourceNode.onended = null;
-      sourceNode.stop();
-      sourceNode = null;
+    // Set the audio source and play
+    audioEl.src = meditationBlobUrl;
+    audioEl.currentTime = 0;
+
+    meditationActive = true;
+
+    try {
+      await audioEl.play();
+    } catch (e) {
+      console.error('Playback failed:', e);
+      meditationActive = false;
+      return;
     }
 
-    // Play the pre-generated buffer immediately
-    sourceNode = audioCtx.createBufferSource();
-    sourceNode.buffer = meditationBuffer;
-    sourceNode.connect(audioCtx.destination);
-
-    startCtxTime = audioCtx.currentTime;
-    sourceNode.start(0);
-
-    sourceNode.onended = () => {
-      if (sourceNode) {
-        finishMeditation(false);
-      }
-    };
-
+    setupMediaSession();
     updateTimerUI();
     showScreen(screenTimer);
 
     uiInterval = setInterval(updateTimerUI, 250);
   }
 
+  // Audio ended naturally — only finish if a meditation is actually running
+  audioEl.addEventListener('ended', () => {
+    if (meditationActive) {
+      finishMeditation(false);
+    }
+  });
+
   function finishMeditation(early) {
     clearInterval(uiInterval);
     uiInterval = null;
 
-    if (early && sourceNode) {
-      sourceNode.onended = null;
-      sourceNode.stop();
-      sourceNode = null;
-    }
-
-    if (!early) {
-      sourceNode = null;
-    }
-
+    // Capture elapsed before pausing (pause makes getElapsedSeconds return 0)
     const elapsed = Math.min(getElapsedSeconds(), totalSeconds);
+
+    meditationActive = false;
+
+    if (early) {
+      audioEl.pause();
+    }
     const mins = Math.floor(elapsed / 60);
     const secs = elapsed % 60;
     let durationText;
@@ -292,10 +406,18 @@
     }
     completeDuration.textContent = `You meditated for ${durationText}.`;
 
+    // Clear media session
+    if ('mediaSession' in navigator) {
+      navigator.mediaSession.metadata = null;
+      navigator.mediaSession.setActionHandler('play', null);
+      navigator.mediaSession.setActionHandler('pause', null);
+      navigator.mediaSession.setActionHandler('stop', null);
+    }
+
     showScreen(screenComplete);
   }
 
-  // Event listeners — regenerate buffer on slider change
+  // Event listeners — regenerate WAV on slider change
   durationSlider.addEventListener('input', () => {
     updateDurationDisplay();
     updateIntervalMax();
@@ -310,13 +432,13 @@
 
   btnStart.addEventListener('click', startTimer);
 
-  btnPause.addEventListener('click', async () => {
+  btnPause.addEventListener('click', () => {
     if (isPaused) {
-      await audioCtx.resume();
+      audioEl.play();
       isPaused = false;
       uiInterval = setInterval(updateTimerUI, 250);
     } else {
-      await audioCtx.suspend();
+      audioEl.pause();
       isPaused = true;
       clearInterval(uiInterval);
     }
@@ -324,13 +446,7 @@
   });
 
   btnFinish.addEventListener('click', () => {
-    if (isPaused && audioCtx) {
-      audioCtx.resume().then(() => {
-        finishMeditation(true);
-      });
-    } else {
-      finishMeditation(true);
-    }
+    finishMeditation(true);
   });
 
   btnDone.addEventListener('click', () => {
