@@ -261,6 +261,14 @@ h2 {
   font-size: 0.95rem;
 }
 
+/* Version */
+.version {
+  text-align: center;
+  font-size: 0.7rem;
+  color: #666666;
+  margin-top: 32px;
+}
+
 /* Desktop polish */
 @media (min-width: 500px) {
   .card {

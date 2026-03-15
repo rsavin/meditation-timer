@@ -21,29 +21,73 @@
 
   // Constants
   const CIRCUMFERENCE = 2 * Math.PI * 90; // r=90
+  const VOLUME = 0.8;
 
   // State
   let totalSeconds = 0;
-  let elapsedSeconds = 0;
-  let intervalMinutes = 0;
-  let timerInterval = null;
   let isPaused = false;
-  let bellsFired = new Set();
+  let uiInterval = null;
 
-  // Audio — MP3 bells
-  const bell1 = new Audio('bell-1.mp3');
-  const bell2 = new Audio('bell-2.mp3');
-  bell1.volume = 0.8;
-  bell2.volume = 0.8;
+  // Web Audio API
+  let audioCtx = null;
+  let sourceNode = null;
+  let bell1Buffer = null;
+  let bell2Buffer = null;
 
-  function playBell1() {
-    bell1.currentTime = 0;
-    bell1.play();
+  // Load an MP3 file and decode it into an AudioBuffer
+  async function loadAudioBuffer(url) {
+    const response = await fetch(url);
+    const arrayBuffer = await response.arrayBuffer();
+    return audioCtx.decodeAudioData(arrayBuffer);
   }
 
-  function playBell2() {
-    bell2.currentTime = 0;
-    bell2.play();
+  // Initialize AudioContext and load bell samples
+  async function initAudio() {
+    if (audioCtx) return;
+    audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+    [bell1Buffer, bell2Buffer] = await Promise.all([
+      loadAudioBuffer('bell-1.mp3'),
+      loadAudioBuffer('bell-2.mp3'),
+    ]);
+  }
+
+  // Build a single AudioBuffer: bell1 → silence → bell2 at intervals → silence → bell1
+  function buildMeditationBuffer(durationSec, intervalMin) {
+    const sampleRate = audioCtx.sampleRate;
+    const channels = Math.max(bell1Buffer.numberOfChannels, bell2Buffer.numberOfChannels);
+    const totalSamples = durationSec * sampleRate;
+    const buffer = audioCtx.createBuffer(channels, totalSamples, sampleRate);
+
+    // Helper: mix a source buffer into the destination buffer at a given sample offset
+    function mixIn(srcBuffer, offsetSamples) {
+      for (let ch = 0; ch < channels; ch++) {
+        const dst = buffer.getChannelData(ch);
+        const srcCh = Math.min(ch, srcBuffer.numberOfChannels - 1);
+        const src = srcBuffer.getChannelData(srcCh);
+        const len = Math.min(src.length, totalSamples - offsetSamples);
+        for (let i = 0; i < len; i++) {
+          dst[offsetSamples + i] += src[i] * VOLUME;
+        }
+      }
+    }
+
+    // Bell 1 at the very start (0:00)
+    mixIn(bell1Buffer, 0);
+
+    // Bell 2 at each interval mark
+    if (intervalMin > 0) {
+      const intervalSec = intervalMin * 60;
+      for (let t = intervalSec; t < durationSec; t += intervalSec) {
+        mixIn(bell2Buffer, t * sampleRate);
+      }
+    }
+
+    // Bell 1 at the very end — place it so it finishes right at (or near) the end
+    // Start it bell1Buffer.duration seconds before the end, but not before 0
+    const endBellStart = Math.max(0, totalSamples - bell1Buffer.length);
+    mixIn(bell1Buffer, endBellStart);
+
+    return buffer;
   }
 
   // Formatting
@@ -103,67 +147,96 @@
     screen.classList.add('active');
   }
 
-  function updateTimerUI() {
-    const remaining = totalSeconds - elapsedSeconds;
-    timeRemaining.textContent = formatTime(remaining);
-    timeElapsed.textContent = `${formatTime(elapsedSeconds)} elapsed`;
+  function getElapsedSeconds() {
+    if (!audioCtx) return 0;
+    // audioCtx.currentTime keeps ticking; we track elapsed via the context time
+    // We store the context time at start, so elapsed = ctx.currentTime - startCtxTime
+    return Math.floor(audioCtx.currentTime - startCtxTime);
+  }
 
-    const progress = elapsedSeconds / totalSeconds;
+  let startCtxTime = 0;
+
+  function updateTimerUI() {
+    const elapsed = Math.min(getElapsedSeconds(), totalSeconds);
+    const remaining = totalSeconds - elapsed;
+    timeRemaining.textContent = formatTime(remaining);
+    timeElapsed.textContent = `${formatTime(elapsed)} elapsed`;
+
+    const progress = elapsed / totalSeconds;
     const offset = CIRCUMFERENCE * (1 - progress);
     ringProgress.style.strokeDasharray = CIRCUMFERENCE;
     ringProgress.style.strokeDashoffset = offset;
   }
 
   // Timer
-  function startTimer() {
+  async function startTimer() {
     const duration = parseInt(durationSlider.value);
-    intervalMinutes = parseInt(intervalSlider.value);
+    const intervalMin = parseInt(intervalSlider.value);
     totalSeconds = duration * 60;
-    elapsedSeconds = 0;
     isPaused = false;
-    bellsFired = new Set();
     btnPause.textContent = 'Pause';
 
     savePrefs();
-    playBell1();
+
+    // Init audio context (needs user gesture — we're inside a click handler)
+    await initAudio();
+
+    // If context was suspended from a previous session, resume it
+    if (audioCtx.state === 'suspended') {
+      await audioCtx.resume();
+    }
+
+    // Build the single meditation audio track
+    const meditationBuffer = buildMeditationBuffer(totalSeconds, intervalMin);
+
+    // Stop any previous source
+    if (sourceNode) {
+      sourceNode.onended = null;
+      sourceNode.stop();
+      sourceNode = null;
+    }
+
+    // Create and play the source
+    sourceNode = audioCtx.createBufferSource();
+    sourceNode.buffer = meditationBuffer;
+    sourceNode.connect(audioCtx.destination);
+
+    // Record context time at start so we can derive elapsed
+    startCtxTime = audioCtx.currentTime;
+    sourceNode.start(0);
+
+    // When the audio naturally ends, finish the meditation
+    sourceNode.onended = () => {
+      if (sourceNode) {
+        finishMeditation(false);
+      }
+    };
+
     updateTimerUI();
     showScreen(screenTimer);
 
-    timerInterval = setInterval(tick, 1000);
-  }
-
-  function tick() {
-    if (isPaused) return;
-
-    elapsedSeconds++;
-    updateTimerUI();
-
-    // Check interval bells
-    if (intervalMinutes > 0) {
-      const elapsedMin = elapsedSeconds / 60;
-      const bellNumber = Math.floor(elapsedMin / intervalMinutes);
-      if (bellNumber > 0 && !bellsFired.has(bellNumber) && elapsedSeconds < totalSeconds) {
-        bellsFired.add(bellNumber);
-        playBell2();
-      }
-    }
-
-    // Check if done
-    if (elapsedSeconds >= totalSeconds) {
-      finishMeditation(false);
-    }
+    // UI update loop
+    uiInterval = setInterval(updateTimerUI, 250);
   }
 
   function finishMeditation(early) {
-    clearInterval(timerInterval);
-    timerInterval = null;
+    clearInterval(uiInterval);
+    uiInterval = null;
 
-    if (!early) {
-      playBell1();
+    if (early && sourceNode) {
+      sourceNode.onended = null;
+      sourceNode.stop();
+      sourceNode = null;
     }
 
-    const mins = Math.floor(elapsedSeconds / 60);
-    const secs = elapsedSeconds % 60;
+    // For natural completion, sourceNode already stopped via onended
+    if (!early) {
+      sourceNode = null;
+    }
+
+    const elapsed = Math.min(getElapsedSeconds(), totalSeconds);
+    const mins = Math.floor(elapsed / 60);
+    const secs = elapsed % 60;
     let durationText;
     if (mins === 0) {
       durationText = `${secs} second${secs !== 1 ? 's' : ''}`;
@@ -188,13 +261,30 @@
 
   btnStart.addEventListener('click', startTimer);
 
-  btnPause.addEventListener('click', () => {
-    isPaused = !isPaused;
+  btnPause.addEventListener('click', async () => {
+    if (isPaused) {
+      // Resume — the audio context picks up exactly where it left off
+      await audioCtx.resume();
+      isPaused = false;
+      uiInterval = setInterval(updateTimerUI, 250);
+    } else {
+      // Pause — suspending the context freezes audio AND context.currentTime
+      await audioCtx.suspend();
+      isPaused = true;
+      clearInterval(uiInterval);
+    }
     btnPause.textContent = isPaused ? 'Resume' : 'Pause';
   });
 
   btnFinish.addEventListener('click', () => {
-    finishMeditation(true);
+    // If paused, resume context first so we can stop cleanly
+    if (isPaused && audioCtx) {
+      audioCtx.resume().then(() => {
+        finishMeditation(true);
+      });
+    } else {
+      finishMeditation(true);
+    }
   });
 
   btnDone.addEventListener('click', () => {
